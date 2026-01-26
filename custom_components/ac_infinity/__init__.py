@@ -1,68 +1,61 @@
 """The ac_infinity integration."""
 from __future__ import annotations
-
 import logging
-
-from ac_infinity_ble import ACInfinityController, DeviceInfo
-
-from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    CONF_ADDRESS,
-    CONF_SERVICE_DATA,
-    Platform,
-)
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
 
-from .const import DOMAIN
 from .coordinator import ACInfinityDataUpdateCoordinator
-from .models import ACInfinityData
-
-PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.FAN]
+from .device import ACInfinityController, BLEDeviceWrapper  # BLEDeviceWrapper if you have a helper
+from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
+async def async_setup(hass: HomeAssistant, config: dict):
+    """Set up the AC Infinity integration (no config flow)."""
+    hass.data.setdefault(DOMAIN, {})
+    return True
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up ac_infinity from a config entry."""
-    address: str = entry.data[CONF_ADDRESS]
-    ble_device = bluetooth.async_ble_device_from_address(hass, address.upper(), True)
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Set up AC Infinity from a config entry."""
+    address = entry.data["address"]
+    ble_device = entry.data.get("ble_device")  # Should be a BLEDeviceWrapper or BleakDevice
     if not ble_device:
-        raise ConfigEntryNotReady(
-            f"Could not find AC Infinity device with address {address}"
-        )
+        _LOGGER.error("No BLE device provided for %s", address)
+        return False
 
-    device_info: DeviceInfo | dict = entry.data[CONF_SERVICE_DATA]
-    if type(device_info) is dict:
-        device_info = DeviceInfo(**entry.data[CONF_SERVICE_DATA])
-    controller = ACInfinityController(ble_device, device_info)
+    # Create controller
+    controller = ACInfinityController(ble_device)
+
+    # Create coordinator
     coordinator = ACInfinityDataUpdateCoordinator(hass, _LOGGER, ble_device, controller)
+    await coordinator.async_wait_ready()
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = ACInfinityData(
-        entry.title, controller, coordinator
-    )
+    # Store references
+    hass.data[DOMAIN][address] = {
+        "controller": controller,
+        "coordinator": coordinator,
+    }
 
-    entry.async_on_unload(coordinator.async_start())
-    if not await coordinator.async_wait_ready():
-        raise ConfigEntryNotReady(f"{address} is not advertising state")
-
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Forward setup to platforms
+    for platform in ["switch", "sensor"]:
+        hass.async_create_task(
+            hass.config_entries.async_forward_entry_setup(entry, platform)
+        )
 
     return True
 
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Unload AC Infinity config entry."""
+    address = entry.data["address"]
+    data = hass.data[DOMAIN].pop(address, None)
 
-async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update."""
-    data: ACInfinityData = hass.data[DOMAIN][entry.entry_id]
-    if entry.title != data.title:
-        await hass.config_entries.async_reload(entry.entry_id)
+    if data:
+        controller: ACInfinityController = data["controller"]
+        await controller.disconnect()
 
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
+    unload_ok = all(
+        await hass.config_entries.async_forward_entry_unload(entry, platform)
+        for platform in ["switch", "sensor"]
+    )
 
     return unload_ok
